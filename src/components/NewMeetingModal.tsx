@@ -3,6 +3,7 @@ import {
   X, Sparkles, Mic, FileAudio, Upload, AlertCircle, RefreshCw, HelpCircle, Laptop, Play, Square, AudioLines
 } from 'lucide-react';
 import { Meeting } from '../types';
+import { auth } from '../firebase';
 
 interface NewMeetingModalProps {
   onClose: () => void;
@@ -44,6 +45,10 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
   const [uploadTitle, setUploadTitle] = useState('');
   const [uploadTemplate, setUploadTemplate] = useState<'scrum' | 'client' | 'interview' | 'sales' | 'investor'>('scrum');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Multilingual & Translation states
+  const [spokenLanguage, setSpokenLanguage] = useState<string>('auto');
+  const [translateToEnglish, setTranslateToEnglish] = useState<boolean>(true);
 
   const stopAllTracks = () => {
     if (activeStreamRef.current) {
@@ -129,32 +134,63 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
             console.warn("Microphone access declined, only recording display audio feedback:", micErr);
           }
 
+          let audioContextMixSuccess = false;
           if (micStream && (displayStream.getAudioTracks().length > 0 || micStream.getAudioTracks().length > 0)) {
-            // Merge display audio track and microphone track via AudioContext node
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            const audioCtx = new AudioContextClass();
-            audioCtxRef.current = audioCtx;
-            const dest = audioCtx.createMediaStreamDestination();
+            try {
+              // Merge display audio track and microphone track via AudioContext node
+              const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+              const audioCtx = new AudioContextClass();
+              audioCtxRef.current = audioCtx;
+              const dest = audioCtx.createMediaStreamDestination();
 
-            if (displayStream.getAudioTracks().length > 0) {
-              const displaySource = audioCtx.createMediaStreamSource(displayStream);
-              displaySource.connect(dest);
-            }
-            if (micStream.getAudioTracks().length > 0) {
-              const micSource = audioCtx.createMediaStreamSource(micStream);
-              micSource.connect(dest);
-            }
+              let displaySourceConnected = false;
+              if (displayStream.getAudioTracks().length > 0) {
+                try {
+                  const displaySource = audioCtx.createMediaStreamSource(displayStream);
+                  displaySource.connect(dest);
+                  displaySourceConnected = true;
+                } catch (errDisplay) {
+                  console.warn("Failed to connect display stream audio source:", errDisplay);
+                }
+              }
 
-            // Route audio alongside user's screen video feed
-            const tracks = [
-              ...dest.stream.getAudioTracks(),
+              let micSourceConnected = false;
+              if (micStream.getAudioTracks().length > 0) {
+                try {
+                  const micSource = audioCtx.createMediaStreamSource(micStream);
+                  micSource.connect(dest);
+                  micSourceConnected = true;
+                } catch (errMic) {
+                  console.warn("Failed to connect mic stream audio source:", errMic);
+                }
+              }
+
+              if (displaySourceConnected || micSourceConnected) {
+                // Route audio alongside user's screen video feed
+                const tracks = [
+                  ...dest.stream.getAudioTracks(),
+                  ...displayStream.getVideoTracks()
+                ];
+                stream = new MediaStream(tracks);
+                activeStreamRef.current = stream;
+                audioContextMixSuccess = true;
+              }
+            } catch (mixErr) {
+              console.warn("AudioContext init or mixing failed, fallback to direct streams:", mixErr);
+            }
+          }
+
+          if (!audioContextMixSuccess) {
+            // Fallback: collect available tracks safely
+            const tracks: MediaStreamTrack[] = [
               ...displayStream.getVideoTracks()
             ];
+            if (displayStream.getAudioTracks().length > 0) {
+              tracks.push(displayStream.getAudioTracks()[0]);
+            } else if (micStream && micStream.getAudioTracks().length > 0) {
+              tracks.push(micStream.getAudioTracks()[0]);
+            }
             stream = new MediaStream(tracks);
-            activeStreamRef.current = stream;
-          } else {
-            // Use display feed
-            stream = displayStream;
             activeStreamRef.current = stream;
           }
         } else {
@@ -163,22 +199,52 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
           activeStreamRef.current = stream;
         }
 
-        // Find compatible audio MIME format
-        let options = { mimeType: 'audio/webm' };
+        // Find compatible audio/video MIME format safely
+        let options: { mimeType?: string } = {};
         if (recordSource === 'screen') {
-          options = { mimeType: 'video/webm' }; // supports video frames
-        }
-        
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-          options = { mimeType: 'audio/webm' };
-          if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options = { mimeType: 'audio/ogg' };
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-              options = { mimeType: 'audio/mp4' };
-              if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options = { mimeType: '' }; // default fallback
+          const videoMimetypes = [
+            'video/webm',
+            'video/webm;codecs=vp8,opus',
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=h264,opus',
+            'video/mp4',
+            'video/x-matroska'
+          ];
+          let foundSupported = false;
+          if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+            for (const mime of videoMimetypes) {
+              if (MediaRecorder.isTypeSupported(mime)) {
+                options = { mimeType: mime };
+                foundSupported = true;
+                break;
               }
             }
+          }
+          if (!foundSupported) {
+            options = {}; // browser fallback
+          }
+        } else {
+          // Microphone only
+          const audioMimetypes = [
+            'audio/webm',
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+            'audio/aac',
+            'audio/wav'
+          ];
+          let foundSupported = false;
+          if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+            for (const mime of audioMimetypes) {
+              if (MediaRecorder.isTypeSupported(mime)) {
+                options = { mimeType: mime };
+                foundSupported = true;
+                break;
+              }
+            }
+          }
+          if (!foundSupported) {
+            options = {}; // browser fallback
           }
         }
 
@@ -204,7 +270,23 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
           const recInstance = new SpeechRecognition();
           recInstance.continuous = true;
           recInstance.interimResults = true;
-          recInstance.lang = 'en-US';
+          
+          const langMap: Record<string, string> = {
+            'auto': 'en-US',
+            'es': 'es-ES',
+            'fr': 'fr-FR',
+            'de': 'de-DE',
+            'zh': 'zh-CN',
+            'ja': 'ja-JP',
+            'ko': 'ko-KR',
+            'hi': 'hi-IN',
+            'ta': 'ta-IN',
+            'it': 'it-IT',
+            'pt': 'pt-BR',
+            'ar': 'ar-SA'
+          };
+          recInstance.lang = langMap[spokenLanguage] || 'en-US';
+          
           recInstance.onresult = (event: any) => {
             let currentFullText = '';
             for (let i = 0; i < event.results.length; i++) {
@@ -221,11 +303,22 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
 
       } catch (err: any) {
         console.error("Multimedia stream acquire blocked:", err);
-        setErrorText(
-          err.name === "NotAllowedError"
-            ? "Permission to share screen / access mic was denied. Please accept browser permissions settings."
-            : "Screen audio feed was rejected or is unsupported. Make sure 'Share tab audio' is ticked when prompted."
-        );
+        const isIframe = window.self !== window.top;
+        if (err.name === "SecurityError" || err.message?.includes("permissions policy") || err.message?.includes("disallowed")) {
+          setErrorText(
+            isIframe
+              ? "Screen & Tab Share is blocked by iframe security policies. Please click the 'Open in New Tab' button in the toolbar above to record screens and tabs perfectly!"
+              : `Security policy block: ${err.message}`
+          );
+        } else if (err.name === "NotAllowedError") {
+          setErrorText("Permission to share screen / access mic was denied. Please accept browser permissions settings.");
+        } else {
+          setErrorText(
+            isIframe
+              ? "Screen selection is restricted inside the editor frame. Just click the 'Open in New Tab' button in the toolbar above to bypass iframe constraints."
+              : "Screen audio feed was rejected or is unsupported. Make sure 'Share tab audio' is ticked when prompted."
+          );
+        }
       }
     }
   };
@@ -235,7 +328,16 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onloadend = () => {
-        const base64String = (reader.result as string).split(',')[1];
+        const resultStr = reader.result as string;
+        const base64Marker = ";base64,";
+        const markerIndex = resultStr.indexOf(base64Marker);
+        let base64String = "";
+        if (markerIndex !== -1) {
+          base64String = resultStr.substring(markerIndex + base64Marker.length);
+        } else {
+          const firstCommaIndex = resultStr.indexOf(",");
+          base64String = firstCommaIndex !== -1 ? resultStr.substring(firstCommaIndex + 1) : resultStr;
+        }
         resolve(base64String);
       };
       reader.onerror = reject;
@@ -262,7 +364,8 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
           title: simTitle.trim(),
           platform: simPlatform,
           template: simTemplate,
-          instructions: simInstructions.trim()
+          instructions: simInstructions.trim(),
+          userId: auth.currentUser?.uid || "anonymous"
         })
       });
 
@@ -308,7 +411,10 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
           template: recordTemplate,
           base64Audio: base64Audio || undefined,
           fileType: mediaRecorder?.mimeType || 'audio/webm',
-          fallbackTranscript: liveTranscript.trim() || undefined
+          fallbackTranscript: liveTranscript.trim() || undefined,
+          userId: auth.currentUser?.uid || "anonymous",
+          spokenLanguage,
+          translateToEnglish
         })
       });
 
@@ -359,7 +465,10 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
           platform: "recording",
           template: uploadTemplate,
           base64Audio: base64Audio,
-          fileType: uploadedFile.type || "audio/webm"
+          fileType: uploadedFile.type || "audio/webm",
+          userId: auth.currentUser?.uid || "anonymous",
+          spokenLanguage,
+          translateToEnglish
         })
       });
 
@@ -692,6 +801,49 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
                     <option value="investor">Investor Briefing Format</option>
                   </select>
                 </div>
+
+                {/* Multilingual / Translation Settings */}
+                <div className="bg-[#F8F7F4] p-3.5 rounded-xl border border-[#E5E5E1] space-y-3 pt-2.5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="font-serif font-bold text-xs text-[#1A1A1A] block">Multilingual intelligence</span>
+                      <span className="text-[9px] text-[#71716A]">Translate conversational audio to English</span>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={translateToEnglish} 
+                        onChange={(e) => setTranslateToEnglish(e.target.checked)}
+                        className="sr-only peer"
+                      />
+                      <div className="w-8 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-[#1A1A1A]"></div>
+                    </label>
+                  </div>
+
+                  {translateToEnglish && (
+                    <div className="space-y-1">
+                      <label className="block text-[#71716A] text-[9px] font-bold uppercase tracking-wider">Spoken Language</label>
+                      <select
+                        value={spokenLanguage}
+                        onChange={(e) => setSpokenLanguage(e.target.value)}
+                        className="w-full bg-white border border-[#E5E5E1] rounded-lg px-2.5 py-1.5 text-xs text-[#1A1A1A] focus:outline-none"
+                      >
+                        <option value="auto">Auto-Detect Spoken Language</option>
+                        <option value="es">Spanish (Español)</option>
+                        <option value="fr">French (Français)</option>
+                        <option value="de">German (Deutsch)</option>
+                        <option value="zh">Chinese (中文)</option>
+                        <option value="ja">Japanese (日本語)</option>
+                        <option value="ko">Korean (한국어)</option>
+                        <option value="hi">Hindi (हिन्दी)</option>
+                        <option value="ta">Tamil (தமிழ்)</option>
+                        <option value="it">Italian (Italiano)</option>
+                        <option value="pt">Portuguese (Português)</option>
+                        <option value="ar">Arabic (العربية)</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Trigger panel */}
@@ -809,6 +961,49 @@ export default function NewMeetingModal({ onClose, onMeetingCreated }: NewMeetin
                       <option value="sales">Sales Call Demographics</option>
                       <option value="investor">Investor Financial Board</option>
                     </select>
+                  </div>
+
+                  {/* Multilingual / Translation Settings */}
+                  <div className="bg-[#F8F7F4] p-3.5 rounded-xl border border-[#E5E5E1] space-y-3 pt-2.5">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="font-serif font-bold text-xs text-[#1A1A1A] block">Multilingual intelligence</span>
+                        <span className="text-[9px] text-[#71716A]">Translate conversational audio to English</span>
+                      </div>
+                      <label className="relative inline-flex items-center cursor-pointer select-none">
+                        <input 
+                          type="checkbox" 
+                          checked={translateToEnglish} 
+                          onChange={(e) => setTranslateToEnglish(e.target.checked)}
+                          className="sr-only peer"
+                        />
+                        <div className="w-8 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-[#1A1A1A]"></div>
+                      </label>
+                    </div>
+
+                    {translateToEnglish && (
+                      <div className="space-y-1">
+                        <label className="block text-[#71716A] text-[9px] font-bold uppercase tracking-wider">Spoken Language</label>
+                        <select
+                          value={spokenLanguage}
+                          onChange={(e) => setSpokenLanguage(e.target.value)}
+                          className="w-full bg-white border border-[#E5E5E1] rounded-lg px-2.5 py-1.5 text-xs text-[#1A1A1A] focus:outline-none"
+                        >
+                          <option value="auto">Auto-Detect Spoken Language</option>
+                          <option value="es">Spanish (Español)</option>
+                          <option value="fr">French (Français)</option>
+                          <option value="de">German (Deutsch)</option>
+                          <option value="zh">Chinese (中文)</option>
+                          <option value="ja">Japanese (日本語)</option>
+                          <option value="ko">Korean (한국어)</option>
+                          <option value="hi">Hindi (हिन्दी)</option>
+                          <option value="ta">Tamil (தமிழ்)</option>
+                          <option value="it">Italian (Italiano)</option>
+                          <option value="pt">Portuguese (Português)</option>
+                          <option value="ar">Arabic (العربية)</option>
+                        </select>
+                      </div>
+                    )}
                   </div>
 
                   <button

@@ -34,6 +34,7 @@ export interface FollowUpData {
 
 export interface Meeting {
   id: string;
+  userId?: string;
   title: string;
   date: string;
   duration: number; // in seconds
@@ -45,6 +46,12 @@ export interface Meeting {
   report?: Report;
   actionItems: ActionItem[];
   followUp?: FollowUpData;
+  videoUrl?: string;
+  audioUrl?: string;
+  hasVideo?: boolean;
+  hasAudio?: boolean;
+  spokenLanguage?: string;
+  translated?: boolean;
 }
 
 export interface SearchResult {

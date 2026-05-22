@@ -148,8 +148,13 @@ export default function MeetingCard({ meeting, isSelected, onSelect, onDelete }:
       </div>
 
       <div className="flex items-center justify-between border-t border-[#E5E5E1] pt-3 mt-3">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           {getTemplateBadge(meeting.template)}
+          {meeting.translated && (
+            <span className="border border-emerald-200 bg-emerald-50/50 text-emerald-800 text-[9px] px-2 py-0.5 rounded font-mono uppercase tracking-wider flex items-center gap-0.5">
+              <span>EN TRANSLATED</span>
+            </span>
+          )}
         </div>
         
         {meeting.status === 'completed' && (

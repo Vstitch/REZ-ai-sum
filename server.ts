@@ -49,6 +49,7 @@ interface FollowUpData {
 
 interface Meeting {
   id: string;
+  userId?: string;
   title: string;
   date: string;
   duration: number; // in seconds
@@ -60,6 +61,12 @@ interface Meeting {
   report?: Report;
   actionItems: ActionItem[];
   followUp?: FollowUpData;
+  videoUrl?: string;
+  audioUrl?: string;
+  hasVideo?: boolean;
+  hasAudio?: boolean;
+  spokenLanguage?: string;
+  translated?: boolean;
 }
 
 // Generate unique ID helper
@@ -98,7 +105,22 @@ function writeDb(data: Meeting[]) {
 let aiInstance: GoogleGenAI | null = null;
 function getAiClient(): GoogleGenAI {
   if (!aiInstance) {
-    const key = process.env.GEMINI_API_KEY;
+    let key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      try {
+        const envExamplePath = path.join(process.cwd(), ".env.example");
+        if (fs.existsSync(envExamplePath)) {
+          const content = fs.readFileSync(envExamplePath, "utf-8");
+          const match = content.match(/GEMINI_API_KEY\s*=\s*["']?([^"\n\r']+)["']?/);
+          if (match && match[1] && match[1] !== "MY_GEMINI_API_KEY" && !match[1].includes("YOUR_")) {
+            key = match[1].trim();
+            console.log("Loaded GEMINI_API_KEY from .env.example fallback");
+          }
+        }
+      } catch (err) {
+        console.error("Failed to read .env.example fallback:", err);
+      }
+    }
     if (!key) {
       throw new Error("GEMINI_API_KEY environment variable is not defined on the server side.");
     }
@@ -194,8 +216,14 @@ const geminiJsonSchema = {
 // 1. Get all meetings
 app.get("/api/meetings", (req, res) => {
   try {
+    const { userId } = req.query;
     const list = readDb();
-    res.json(list);
+    if (userId) {
+      const filtered = list.filter(m => m.userId === userId || m.userId === undefined || m.userId === "anonymous");
+      res.json(filtered);
+    } else {
+      res.json(list);
+    }
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -239,7 +267,7 @@ app.delete("/api/meetings/:id", (req, res) => {
 
 // 4. Run AI Simulation Generative Meeting
 app.post("/api/meetings/simulate", async (req, res) => {
-  const { title, platform, template, instructions } = req.body;
+  const { title, platform, template, instructions, userId } = req.body;
 
   if (!title || !template) {
     res.status(400).json({ error: "Title and template are required parameters." });
@@ -251,6 +279,7 @@ app.post("/api/meetings/simulate", async (req, res) => {
   const list = readDb();
   const freshMeeting: Meeting = {
     id: mId,
+    userId: userId || "anonymous",
     title: title,
     date: new Date().toISOString(),
     duration: 120, // baseline placeholder
@@ -336,17 +365,83 @@ app.post("/api/meetings/simulate", async (req, res) => {
 
 // 5. Run REAL Speech-to-Text Transcription via audio record / upload
 app.post("/api/meetings/upload-audio", async (req, res) => {
-  const { title, platform, template, base64Audio, fileType, fallbackTranscript } = req.body;
+  const { title, platform, template, base64Audio, fileType, fallbackTranscript, userId, spokenLanguage, translateToEnglish } = req.body;
 
   if (!base64Audio && !fallbackTranscript) {
     res.status(400).json({ error: "Either a base64 encoded audio sequence or a speech transcript is required for processing." });
     return;
   }
 
+  // --- CLEAN BASE64 AND Mimetype FOR ROBUST GEMINI PROCESSING ---
+  let cleanBase64 = base64Audio || "";
+  if (cleanBase64) {
+    const base64Marker = ";base64,";
+    const markerIndex = cleanBase64.indexOf(base64Marker);
+    if (markerIndex !== -1) {
+      cleanBase64 = cleanBase64.substring(markerIndex + base64Marker.length);
+    } else {
+      // Check for generic comma prefix
+      const commaIndex = cleanBase64.indexOf(",");
+      if (commaIndex !== -1 && commaIndex < 100) {
+        cleanBase64 = cleanBase64.substring(commaIndex + 1);
+      }
+    }
+    // Safeguard to strip any partial or malformed base64 headers that might leak through (e.g., opus;base64)
+    if (cleanBase64.includes(";base64")) {
+      const idx = cleanBase64.indexOf(";base64");
+      cleanBase64 = cleanBase64.substring(idx + 7);
+      if (cleanBase64.startsWith(",")) {
+        cleanBase64 = cleanBase64.substring(1);
+      }
+    }
+    cleanBase64 = cleanBase64.replace(/\s/g, "");
+  }
+
+  let cleanMimeType = fileType || "audio/webm";
+  if (cleanMimeType.includes(";")) {
+    cleanMimeType = cleanMimeType.split(";")[0];
+  }
+  cleanMimeType = cleanMimeType.trim();
+
   const mId = generateId();
+
+  let savedAudioUrl: string | undefined = undefined;
+  let savedVideoUrl: string | undefined = undefined;
+  let localHasAudio = false;
+  let localHasVideo = false;
+
+  if (cleanBase64) {
+    try {
+      const uploadsDir = path.join(process.cwd(), "media_uploads");
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      const isVideo = cleanMimeType && cleanMimeType.includes("video");
+      const ext = "webm"; // standard container format
+      const fName = `meeting_${mId}.${ext}`;
+      const fPath = path.join(uploadsDir, fName);
+      const dataBuffer = Buffer.from(cleanBase64, "base64");
+      fs.writeFileSync(fPath, dataBuffer);
+
+      if (isVideo || (platform && platform !== "recording" && platform !== "upload")) {
+        savedVideoUrl = `/media_uploads/${fName}`;
+        savedAudioUrl = `/media_uploads/${fName}`;
+        localHasVideo = true;
+        localHasAudio = true;
+      } else {
+        savedAudioUrl = `/media_uploads/${fName}`;
+        localHasAudio = true;
+      }
+    } catch (saveErr) {
+      console.error("Error writing uploaded media file to disk:", saveErr);
+    }
+  }
+
   const list = readDb();
   const newRecording: Meeting = {
     id: mId,
+    userId: userId || "anonymous",
     title: title || `Voice Ingested Notes — ${new Date().toLocaleTimeString()}`,
     date: new Date().toISOString(),
     duration: 12, // default short duration estimate
@@ -354,7 +449,13 @@ app.post("/api/meetings/upload-audio", async (req, res) => {
     template: template || "scrum",
     status: "processing",
     transcript: [],
-    actionItems: []
+    actionItems: [],
+    audioUrl: savedAudioUrl,
+    videoUrl: savedVideoUrl,
+    hasAudio: localHasAudio,
+    hasVideo: localHasVideo,
+    spokenLanguage: spokenLanguage || 'auto',
+    translated: translateToEnglish === true || translateToEnglish === 'true' || false
   };
   list.unshift(newRecording);
   writeDb(list);
@@ -362,18 +463,21 @@ app.post("/api/meetings/upload-audio", async (req, res) => {
   try {
     const ai = getAiClient();
     
-    // Prepare multi-modal contents array for Gemini
-    const contents: any[] = [];
+    // Prepare multi-modal parts for Gemini
+    const parts: any[] = [];
 
     // Pass the base64 audio block if present
-    if (base64Audio) {
-      contents.push({
+    if (cleanBase64) {
+      parts.push({
         inlineData: {
-          data: base64Audio,
-          mimeType: fileType || "audio/webm"
+          data: cleanBase64,
+          mimeType: cleanMimeType
         }
       });
     }
+
+    const isTranslating = translateToEnglish === true || translateToEnglish === 'true';
+    const cleanSpokenLang = spokenLanguage || 'auto';
 
     const promptText = `
     You are an AI Speech-to-Text specialist and business analyst.
@@ -385,6 +489,14 @@ app.post("/api/meetings/upload-audio", async (req, res) => {
     """
     Use this captured text draft to supplement, correct, or replace any noisy/missing audio pieces.` : ''}
 
+    ${isTranslating ? `
+    CRITICAL MULTILINGUAL TRANSLATION DIRECTIVE:
+    The user has specified that the input spoken audio or text stream may be in a foreign language (configured language or auto-detected language is: "${cleanSpokenLang}").
+    You MUST TRANSLATE all transcribing spoken dialogue and text content into fluent, professional, natural, grammatically correct ENGLISH.
+    The output transcript array (including every single "text" utterance in conversational pieces) MUST be fully translated to English.
+    Every part of the final structured reports, summaries, titles, decisions, action item owners/tasks, risks, follow-up emails, and template metrics must be outputted strictly in ENGLISH.
+    ` : ''}
+
     Your tasks:
     1. Transcribe/Segment the spoken meeting content precisely with high speech fidelity. Diarize the outputs intelligently into speakers (e.g. "Speaker 1", "Speaker 2", or custom names if self-identified). If you are primarily reading the text draft, structure the speakers as sensible meeting participants (such as "Me", "Client", or self-identified names). Divide into structured chunks with start and end times in seconds.
     2. Convert this speech transcription into a full professional Meeting Analysis record.
@@ -394,11 +506,11 @@ app.post("/api/meetings/upload-audio", async (req, res) => {
     Format the complete generated contents to fit the requested JSON structural schema. Return raw JSON matching the requested schema exactly.
     `;
 
-    contents.push(promptText);
+    parts.push({ text: promptText });
 
     const response = await ai.models.generateContent({
       model: "gemini-3.5-flash",
-      contents: contents,
+      contents: { parts },
       config: {
         responseMimeType: "application/json",
         responseSchema: geminiJsonSchema,
@@ -585,6 +697,13 @@ app.post("/api/search", async (req, res) => {
 
 // --- COMBINE EXPRESS ROUTERS WITH VITE AS MIDDLEWARE ---
 async function startServer() {
+  // Ensure the media uploads folder exists recursively on bootstrap
+  const uploadsDir = path.join(process.cwd(), "media_uploads");
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  app.use("/media_uploads", express.static(uploadsDir));
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
