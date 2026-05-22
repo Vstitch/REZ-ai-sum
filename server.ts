@@ -1,0 +1,607 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+// Set up larger limit for base64 audio uploads
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// --- PERSISTENT DATA FILE HANDLING ---
+const DB_FILE = path.join(process.cwd(), "meetings_db.json");
+
+interface ActionItem {
+  id: string;
+  meetingId: string;
+  owner: string;
+  task: string;
+  deadline: string;
+  status: 'pending' | 'completed';
+}
+
+interface TranscriptChunk {
+  speaker: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface Report {
+  summary: string;
+  decisions: string[];
+  risks: string[];
+  nextMeeting?: string;
+  templateSpecific: Record<string, string | string[]>;
+}
+
+interface FollowUpData {
+  email: string;
+  slack: string;
+  recap: string;
+}
+
+interface Meeting {
+  id: string;
+  title: string;
+  date: string;
+  duration: number; // in seconds
+  platform: 'zoom' | 'google-meet' | 'teams' | 'slack' | 'discord' | 'recording';
+  template: 'scrum' | 'client' | 'interview' | 'sales' | 'investor';
+  status: 'processing' | 'completed' | 'failed';
+  error?: string;
+  transcript: TranscriptChunk[];
+  report?: Report;
+  actionItems: ActionItem[];
+  followUp?: FollowUpData;
+}
+
+// Generate unique ID helper
+const generateId = () => "meet_" + Math.random().toString(36).substring(2, 11);
+
+// Boot up initial sample data
+const bootstrapData: Meeting[] = [];
+
+// Read from database
+function readDb(): Meeting[] {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const data = fs.readFileSync(DB_FILE, "utf-8");
+      return JSON.parse(data);
+    } else {
+      // Bootstrap with preloaded samples
+      writeDb(bootstrapData);
+      return bootstrapData;
+    }
+  } catch (e) {
+    console.error("Error reading database file, returning in-memory bootstrap:", e);
+    return bootstrapData;
+  }
+}
+
+// Write to database
+function writeDb(data: Meeting[]) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Error writing database file:", e);
+  }
+}
+
+// --- LAZY INITIALIZATION OF GEMINI SDK CLIENT ---
+let aiInstance: GoogleGenAI | null = null;
+function getAiClient(): GoogleGenAI {
+  if (!aiInstance) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY environment variable is not defined on the server side.");
+    }
+    aiInstance = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
+  }
+  return aiInstance;
+}
+
+// --- DEFINE SCHEMA FOR RESPONSES ---
+const geminiJsonSchema = {
+  type: Type.OBJECT,
+  properties: {
+    title: { type: Type.STRING, description: "A highly descriptive, smart title for the meeting." },
+    durationSeconds: { type: Type.INTEGER, description: "Calculated duration of this discussion in seconds." },
+    transcript: {
+      type: Type.ARRAY,
+      description: "Dialogue broken down into speaker parts.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          speaker: { type: Type.STRING, description: "The name of the speaking individual." },
+          start: { type: Type.NUMBER, description: "The timestamp in seconds since the meeting started when this chunk begins." },
+          end: { type: Type.NUMBER, description: "The timestamp in seconds since the meeting started when this chunk ends." },
+          text: { type: Type.STRING, description: "The text of what was spoken." }
+        },
+        required: ["speaker", "start", "end", "text"]
+      }
+    },
+    report: {
+      type: Type.OBJECT,
+      description: "Structured corporate analysis reports.",
+      properties: {
+        summary: { type: Type.STRING, description: "A detailed markdown content containing discussions, key contexts, and summaries." },
+        decisions: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Array of critical commitments or decisions reached." },
+        risks: { type: Type.ARRAY, items: { type: Type.STRING }, description: "List of hazards, conflicts, or roadblocks identified." },
+        nextMeeting: { type: Type.STRING, description: "Recommended follow up sync date and topic." },
+        templateSpecific: {
+          type: Type.OBJECT,
+          description: "Crucial context properties based on meeting category.",
+          properties: {
+            "Blockers": { type: Type.STRING, description: "Sprint bottleneck summaries for agile scrum syncs." },
+            "Sprint Updates": { type: Type.STRING, description: "Overall sprint achievement highlights." },
+            "Requirements": { type: Type.STRING, description: "Client deliverables checklists and requirements." },
+            "Deliverables": { type: Type.STRING, description: "Concrete code/system deliverables expected of agency." },
+            "Strengths": { type: Type.STRING, description: "Key applicant virtues for screening/interview reviews." },
+            "Concerns": { type: Type.STRING, description: "Aptitude, experience or logistical risks in applicant profile." },
+            "Recommendation": { type: Type.STRING, description: "Clear progression recommendation (e.g. Reject, Hire, Panel Sync)." },
+            "Objections": { type: Type.STRING, description: "Customer pricing/timeline or technical constraints." },
+            "Pricing Concerns": { type: Type.STRING, description: "How pricing structures fit into sales expectations." },
+            "Metrics": { type: Type.STRING, description: "Key operational or performance metric disclosures for investors." },
+            "Asks": { type: Type.STRING, description: "Capital, resource, or partnership asks defined in board sync." }
+          }
+        }
+      },
+      required: ["summary", "decisions", "risks"]
+    },
+    actionItems: {
+      type: Type.ARRAY,
+      description: "Action assignments with owners.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          owner: { type: Type.STRING, description: "Who owns the task specifically (often John, Sarah, or Vinitha)." },
+          task: { type: Type.STRING, description: "Distinct, actionable task description." },
+          deadline: { type: Type.STRING, description: "Target deadline description (e.g. Wednesday, Monday Sync, Next week)." }
+        },
+        required: ["owner", "task", "deadline"]
+      }
+    },
+    followUp: {
+      type: Type.OBJECT,
+      description: "AI Generated ready-to-deploy sync messages.",
+      properties: {
+        email: { type: Type.STRING, description: "Subject line and clear formatted corporate email draft body." },
+        slack: { type: Type.STRING, description: "Rich Slack markdown text format summary featuring list items and highlights." },
+        recap: { type: Type.STRING, description: "A quick, humble executive summary recap." }
+      },
+      required: ["email", "slack", "recap"]
+    }
+  },
+  required: ["title", "durationSeconds", "transcript", "report", "actionItems", "followUp"]
+};
+
+// --- HTTP API ROUTERS ---
+
+// 1. Get all meetings
+app.get("/api/meetings", (req, res) => {
+  try {
+    const list = readDb();
+    res.json(list);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Toggle Action Item Status
+app.post("/api/meetings/:meetingId/actions/:actionId/toggle", (req, res) => {
+  try {
+    const { meetingId, actionId } = req.params;
+    const list = readDb();
+    const meet = list.find(m => m.id === meetingId);
+    if (!meet) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    const idx = meet.actionItems.findIndex(a => a.id === actionId);
+    if (idx === -1) {
+      res.status(404).json({ error: "Action item not found" });
+      return;
+    }
+    meet.actionItems[idx].status = meet.actionItems[idx].status === 'pending' ? 'completed' : 'pending';
+    writeDb(list);
+    res.json(meet);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. Delete Meeting
+app.delete("/api/meetings/:id", (req, res) => {
+  try {
+    const { id } = req.params;
+    let list = readDb();
+    list = list.filter(m => m.id !== id);
+    writeDb(list);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. Run AI Simulation Generative Meeting
+app.post("/api/meetings/simulate", async (req, res) => {
+  const { title, platform, template, instructions } = req.body;
+
+  if (!title || !template) {
+    res.status(400).json({ error: "Title and template are required parameters." });
+    return;
+  }
+
+  // Create temporary record showing "processing"
+  const mId = generateId();
+  const list = readDb();
+  const freshMeeting: Meeting = {
+    id: mId,
+    title: title,
+    date: new Date().toISOString(),
+    duration: 120, // baseline placeholder
+    platform: platform || "zoom",
+    template: template,
+    status: "processing",
+    transcript: [],
+    actionItems: []
+  };
+  list.unshift(freshMeeting);
+  writeDb(list);
+
+  try {
+    const ai = getAiClient();
+    const systemPrompt = `You are an advanced AI Meeting Analyst. Your task is to generate simulated multi-speaker transcript dialogue AND structured reports for a corporate meeting.
+    Title requested: "${title}"
+    Meeting platform: "${platform}"
+    Template selected: "${template}" (Scrum updates / Client feedback / Interview scores / Sales Objections / Investor asks)
+    Additional detail: "${instructions || 'No extra context provided. Invent a hyper-realistic, highly relevant industry topic.'}"
+
+    Develop a rich, highly authentic transcript conversation (at least 5 exchanges between speakers such as John, Sarah, Vinitha, HR, Liam, or external stakeholders) with proper timestamps, discussions, decisions, risks, action items, and template-specific blocks. Make the discussion content realistic, engaging, and highly professional. Return JSON matching the required schema. Ensure values in templateSpecific match properties that fit the "${template}" category. Example: if scrum, populate "Blockers" and "Sprint Updates". If client, populate "Requirements" and "Deliverables". If interview, populate "Strengths" and "Concerns".
+    `;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: systemPrompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: geminiJsonSchema,
+        temperature: 0.7
+      }
+    });
+
+    const outputText = response.text;
+    if (!outputText) {
+      throw new Error("No output response text returned from Gemini API");
+    }
+
+    const aiResult = JSON.parse(outputText.trim());
+
+    // Merge generated fields into our meeting
+    const completedList = readDb();
+    const currentIdx = completedList.findIndex(m => m.id === mId);
+    if (currentIdx !== -1) {
+      const dbMeet = completedList[currentIdx];
+      dbMeet.title = aiResult.title || title;
+      dbMeet.duration = aiResult.durationSeconds || 120;
+      dbMeet.status = "completed";
+      dbMeet.transcript = aiResult.transcript || [];
+      dbMeet.report = aiResult.report || { summary: "Summary missing", decisions: [], risks: [], templateSpecific: {} };
+      
+      // Inject IDs for action items
+      dbMeet.actionItems = (aiResult.actionItems || []).map((a: any, i: number) => ({
+        id: `act_${mId}_${i}`,
+        meetingId: mId,
+        owner: a.owner || "Unspecified",
+        task: a.task || "Task detail missing",
+        deadline: a.deadline || "TBD",
+        status: "pending" as const
+      }));
+
+      dbMeet.followUp = aiResult.followUp || { email: "", slack: "", recap: "" };
+
+      completedList[currentIdx] = dbMeet;
+      writeDb(completedList);
+      res.json(dbMeet);
+    } else {
+      res.status(404).json({ error: "Session meeting state lost during computation." });
+    }
+
+  } catch (err: any) {
+    console.error("Gemini Meeting Simulation Error:", err);
+    const failedList = readDb();
+    const idx = failedList.findIndex(m => m.id === mId);
+    if (idx !== -1) {
+      failedList[idx].status = "failed";
+      failedList[idx].error = err.message || "Failed during Gemini processing";
+      writeDb(failedList);
+    }
+    res.status(500).json({ error: `AI Processing failed: ${err.message}` });
+  }
+});
+
+// 5. Run REAL Speech-to-Text Transcription via audio record / upload
+app.post("/api/meetings/upload-audio", async (req, res) => {
+  const { title, platform, template, base64Audio, fileType, fallbackTranscript } = req.body;
+
+  if (!base64Audio && !fallbackTranscript) {
+    res.status(400).json({ error: "Either a base64 encoded audio sequence or a speech transcript is required for processing." });
+    return;
+  }
+
+  const mId = generateId();
+  const list = readDb();
+  const newRecording: Meeting = {
+    id: mId,
+    title: title || `Voice Ingested Notes — ${new Date().toLocaleTimeString()}`,
+    date: new Date().toISOString(),
+    duration: 12, // default short duration estimate
+    platform: platform || "recording",
+    template: template || "scrum",
+    status: "processing",
+    transcript: [],
+    actionItems: []
+  };
+  list.unshift(newRecording);
+  writeDb(list);
+
+  try {
+    const ai = getAiClient();
+    
+    // Prepare multi-modal contents array for Gemini
+    const contents: any[] = [];
+
+    // Pass the base64 audio block if present
+    if (base64Audio) {
+      contents.push({
+        inlineData: {
+          data: base64Audio,
+          mimeType: fileType || "audio/webm"
+        }
+      });
+    }
+
+    const promptText = `
+    You are an AI Speech-to-Text specialist and business analyst.
+    Below is a voice recording submission and/or client-side browser transcript of a meeting, discussion or vocal note.
+    
+    ${fallbackTranscript ? `For reference, the browser real-time speech capturer logged this script draft:
+    """
+    ${fallbackTranscript}
+    """
+    Use this captured text draft to supplement, correct, or replace any noisy/missing audio pieces.` : ''}
+
+    Your tasks:
+    1. Transcribe/Segment the spoken meeting content precisely with high speech fidelity. Diarize the outputs intelligently into speakers (e.g. "Speaker 1", "Speaker 2", or custom names if self-identified). If you are primarily reading the text draft, structure the speakers as sensible meeting participants (such as "Me", "Client", or self-identified names). Divide into structured chunks with start and end times in seconds.
+    2. Convert this speech transcription into a full professional Meeting Analysis record.
+    3. Generate high-quality Decisions, Action items, Risks, and specific template properties fitting the template category "${template || 'scrum'}".
+    4. Provide neat follow up emails, slack texts and bullet summaries.
+    
+    Format the complete generated contents to fit the requested JSON structural schema. Return raw JSON matching the requested schema exactly.
+    `;
+
+    contents.push(promptText);
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: contents,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: geminiJsonSchema,
+        temperature: 0.15
+      }
+    });
+
+    const outputText = response.text;
+    if (!outputText) {
+      throw new Error("No output speech transcription returned from Gemini SDK");
+    }
+
+    const aiResult = JSON.parse(outputText.trim());
+
+    // Update meeting elements
+    const completedList = readDb();
+    const currentIdx = completedList.findIndex(m => m.id === mId);
+    if (currentIdx !== -1) {
+      const dbMeet = completedList[currentIdx];
+      dbMeet.title = title || aiResult.title || `Voice Recording Note — ${new Date().toLocaleTimeString()}`;
+      dbMeet.duration = aiResult.durationSeconds || 15;
+      dbMeet.status = "completed";
+      dbMeet.transcript = aiResult.transcript || [];
+      dbMeet.report = aiResult.report || { summary: "Vocal recording transcription captured successfully.", decisions: [], risks: [], templateSpecific: {} };
+      
+      dbMeet.actionItems = (aiResult.actionItems || []).map((a: any, i: number) => ({
+        id: `act_${mId}_${i}`,
+        meetingId: mId,
+        owner: a.owner || "You",
+        task: a.task || "Actionable note item",
+        deadline: a.deadline || "Next days",
+        status: "pending" as const
+      }));
+
+      dbMeet.followUp = aiResult.followUp || { email: "", slack: "", recap: "" };
+
+      completedList[currentIdx] = dbMeet;
+      writeDb(completedList);
+      res.json(dbMeet);
+    } else {
+      res.status(404).json({ error: "Session meeting state lost." });
+    }
+
+  } catch (err: any) {
+    console.error("Gemini Premium Voice Transcription error:", err);
+    const failedList = readDb();
+    const idx = failedList.findIndex(m => m.id === mId);
+    if (idx !== -1) {
+      failedList[idx].status = "failed";
+      failedList[idx].error = `Voice transcription failure: ${err.message}. If the recording was empty or corrupt, please try another audio sample.`;
+      writeDb(failedList);
+    }
+    res.status(500).json({ error: `AI Speech Processing failed: ${err.message}` });
+  }
+});
+
+// 6. Gemini-powered Universal Semantic Search (Meeting Memory System)
+app.post("/api/search", async (req, res) => {
+  const { query } = req.body;
+  if (!query) {
+    res.status(400).json({ error: "Search query string is required" });
+    return;
+  }
+
+  try {
+    const ai = getAiClient();
+    const list = readDb().filter(m => m.status === "completed");
+
+    // Format all meeting details for Gemini semantic reading
+    const formattedContext = list.map((m, index) => {
+      const transcriptFormatted = m.transcript.map(t => `[${t.speaker}]: ${t.text}`).join("\n");
+      const summaryFormatted = m.report?.summary || "";
+      const decisionsFormatted = (m.report?.decisions || []).join(", ");
+      const actionsFormatted = m.actionItems.map(a => `${a.owner} -> ${a.task} (${a.deadline})`).join("; ");
+      
+      return `
+      Meeting Index: ${index}
+      Meeting Title: "${m.title}"
+      Meeting Date: ${m.date}
+      Meeting Category: ${m.template}
+      Summary: ${summaryFormatted}
+      Decisions: ${decisionsFormatted}
+      Action Items: ${actionsFormatted}
+      Full Word Transcript:
+      ${transcriptFormatted}
+      ---
+      `;
+    }).join("\n\n");
+
+    const searchPrompt = `
+    You are the central Knowledge Memory Engine of Rez AI corporate intelligence network.
+    A user is asking an executive question regarding their historical meeting data: "${query}".
+    
+    A total of ${list.length} completed meetings are stored in your memory system.
+    Read the formatted meeting contexts provided below to formulate a highly helpful, factually precise answer.
+    
+    --- MEETING DATA START ---
+    ${formattedContext}
+    --- MEETING DATA END ---
+
+    Identify:
+    1. A synthesized, detailed, markdown-formatted response string ("aiAnswer") answering the user query. Reference specific meeting details, timelines, names, or metrics with elegant corporate clarity. If the answer is completely absent from the recordings, state that politely.
+    2. A list of stored meetings that are relevant to this request ("meetings"), including a short description detailing why that meeting contains the answer ("relevance").
+    3. Direct citations ("citations") mapping back to exact text spoken in a transcript. Provide the exact "speaker", "text" quote, and the "meetingTitle" source.
+
+    You must format your response to EXACTLY match this JSON schema:
+    {
+      "aiAnswer": "Detailed markdown explanation answering key point in query...",
+      "meetings": [
+        { "id": "meeting-id", "title": "Meeting Title", "date": "ISO string", "platform": "zoom", "relevance": "Why relevant..." }
+      ],
+      "citations": [
+        { "meetingTitle": "Meeting Title", "speaker": "Speaker Name", "text": "Exact text quote of context..." }
+      ]
+    }
+
+    Respond with ONLY raw JSON string. Do not append explanation text outside the JSON block.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: searchPrompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            aiAnswer: { type: Type.STRING },
+            meetings: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  date: { type: Type.STRING },
+                  platform: { type: Type.STRING },
+                  relevance: { type: Type.STRING }
+                },
+                required: ["id", "title", "date", "platform", "relevance"]
+              }
+            },
+            citations: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  meetingTitle: { type: Type.STRING },
+                  speaker: { type: Type.STRING },
+                  text: { type: Type.STRING }
+                },
+                required: ["meetingTitle", "speaker", "text"]
+              }
+            }
+          },
+          required: ["aiAnswer", "meetings", "citations"]
+        }
+      }
+    });
+
+    const outputText = response.text;
+    if (!outputText) {
+      throw new Error("No web content searched from Gemini engine.");
+    }
+
+    const compiledResult = JSON.parse(outputText.trim());
+    
+    // Map database IDs accurately to returned results to align matching links
+    compiledResult.meetings = compiledResult.meetings.map((m: any) => {
+      const matched = list.find(dbm => dbm.title.toLowerCase().includes(m.title.toLowerCase()) || m.title.toLowerCase().includes(dbm.title.toLowerCase()));
+      return {
+        ...m,
+        id: matched ? matched.id : m.id
+      };
+    });
+
+    res.json(compiledResult);
+
+  } catch (err: any) {
+    console.error("Gemini Semantic Search memory error:", err);
+    res.status(500).json({ error: `Searching failed: ${err.message}` });
+  }
+});
+
+// --- COMBINE EXPRESS ROUTERS WITH VITE AS MIDDLEWARE ---
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Rez AI full-stack server operating at http://localhost:${PORT}`);
+  });
+}
+
+startServer();
